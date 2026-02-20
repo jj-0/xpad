@@ -128,6 +128,12 @@ static inline int usb_control_msg_recv(struct usb_device *dev, __u8 endpoint,
 #define timer_container_of from_timer
 #endif
 
+// backward compatibility for kernel < 4.15 (ida_alloc/ida_free not available)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,15,0)
+#define ida_alloc(ida, gfp)		ida_simple_get(ida, 0, 0, gfp)
+#define ida_free(ida, id)		ida_simple_remove(ida, id)
+#endif
+
 // enable compilation on pre 6.1 kernels
 #ifndef ABS_PROFILE
 #define ABS_PROFILE ABS_MISC
@@ -1978,6 +1984,17 @@ static int xpad_init_ff(struct usb_xpad *xpad) { return 0; }
 #if defined(CONFIG_JOYSTICK_XPAD_LEDS)
 #include <linux/leds.h>
 #include <linux/idr.h>
+
+// backward compatibility for kernel < 3.13 (led_set_brightness not available)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,13,0)
+static inline void led_set_brightness(struct led_classdev *led_cdev,
+				      enum led_brightness brightness)
+{
+	led_cdev->brightness = brightness;
+	if (led_cdev->brightness_set)
+		led_cdev->brightness_set(led_cdev, brightness);
+}
+#endif
 
 static DEFINE_IDA(xpad_pad_seq);
 
