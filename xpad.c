@@ -63,7 +63,7 @@
 
 // #define DEBUG
 #include <linux/version.h>
-#include <linux/bits.h>
+#include "bits.h"
 #include <linux/kernel.h>
 #include <linux/input.h>
 #include <linux/rcupdate.h>
@@ -73,6 +73,50 @@
 #include <linux/usb/input.h>
 #include <linux/usb/quirks.h>
 #include <linux/timer.h>
+
+// backward compatibility for kernels < 3.17 (time64_t, ktime_get_seconds not available)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(3,17,0)
+#include <linux/time.h>
+typedef unsigned long time64_t;
+#define ktime_get_seconds get_seconds
+#endif
+
+// backward compatibility for kernels < 3.12 (GENMASK not available)
+#ifndef GENMASK
+#define GENMASK(h, l) (((1UL << ((h) - (l) + 1)) - 1) << (l))
+#endif
+
+// backward compatibility for kernel < 4.15: old timer API
+#if LINUX_VERSION_CODE < KERNEL_VERSION(4,15,0)
+#define timer_setup(_timer, _callback, _flags) \
+	setup_timer((_timer), (void (*)(unsigned long))(_callback), \
+		    (unsigned long)(_timer))
+#define from_timer(var, callback_timer, timer_fieldname) \
+	container_of(callback_timer, typeof(*var), timer_fieldname)
+#endif
+
+// backward compatibility for kernel < 5.18 (usb_control_msg_recv not available)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(5,18,0)
+static inline int usb_control_msg_recv(struct usb_device *dev, __u8 endpoint,
+	__u8 request, __u8 requesttype, __u16 value, __u16 index,
+	void *driver_data, size_t size, int timeout, gfp_t memflags)
+{
+	unsigned int pipe = usb_rcvctrlpipe(dev, endpoint);
+	int ret;
+	u8 *buf;
+
+	buf = kmalloc(size, memflags);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = usb_control_msg(dev, pipe, request, requesttype,
+			      value, index, buf, size, timeout);
+	if (ret >= 0)
+		memcpy(driver_data, buf, min_t(size_t, ret, size));
+	kfree(buf);
+	return ret < 0 ? ret : 0;
+}
+#endif
 
 // backward compatibility. del_timer_sync is renamed to timer_delete_sync since 6.15.0
 #if LINUX_VERSION_CODE < KERNEL_VERSION(6,15,0)
@@ -90,6 +134,7 @@
 #endif
 
 #define XPAD_PKT_LEN 64
+#define XPAD_STICK_THRESHOLD 16384
 
 /* The Guitar Hero Live (GHL) Xbox One dongles require a poke 
  * every 8 seconds.
@@ -106,6 +151,7 @@
 #define MAP_SELECT_BUTTON		(1 << 3)
 #define MAP_PADDLES			(1 << 4)
 #define MAP_PROFILE_BUTTON		(1 << 5)
+#define MAP_STICKS_TO_BUTTONS		(1 << 6)
 
 #define DANCEPAD_MAP_CONFIG	(MAP_DPAD_TO_BUTTONS |			\
 				MAP_TRIGGERS_TO_BUTTONS | MAP_STICKS_TO_NULL)
@@ -145,6 +191,10 @@ MODULE_PARM_DESC(triggers_to_buttons, "Map triggers to buttons rather than axes 
 static bool sticks_to_null;
 module_param(sticks_to_null, bool, S_IRUGO);
 MODULE_PARM_DESC(sticks_to_null, "Do not map sticks at all for unknown pads");
+
+static bool axes_to_buttons;
+module_param(axes_to_buttons, bool, S_IRUGO);
+MODULE_PARM_DESC(axes_to_buttons, "Map analog sticks and triggers to digital buttons");
 
 static bool auto_poweroff = true;
 module_param(auto_poweroff, bool, S_IWUSR | S_IRUGO);
@@ -462,6 +512,15 @@ static const signed short xpad_btn_pad[] = {
 /* used when triggers are mapped to buttons */
 static const signed short xpad_btn_triggers[] = {
 	BTN_TL2, BTN_TR2,		/* triggers left/right */
+	-1
+};
+
+/* used when sticks are mapped to buttons */
+static const signed short xpad_btn_sticks[] = {
+	BTN_TRIGGER_HAPPY9, BTN_TRIGGER_HAPPY10,	/* left stick up, down */
+	BTN_TRIGGER_HAPPY11, BTN_TRIGGER_HAPPY12,	/* left stick left, right */
+	BTN_TRIGGER_HAPPY13, BTN_TRIGGER_HAPPY14,	/* right stick up, down */
+	BTN_TRIGGER_HAPPY15, BTN_TRIGGER_HAPPY16,	/* right stick left, right */
 	-1
 };
 
@@ -898,7 +957,21 @@ static void xpad_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char *d
 {
 	struct input_dev *dev = xpad->dev;
 
-	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+	if (xpad->mapping & MAP_STICKS_TO_BUTTONS) {
+		__s16 lx = (__s16) le16_to_cpup((__le16 *)(data + 12));
+		__s16 ly = ~(__s16) le16_to_cpup((__le16 *)(data + 14));
+		__s16 rx = (__s16) le16_to_cpup((__le16 *)(data + 16));
+		__s16 ry = ~(__s16) le16_to_cpup((__le16 *)(data + 18));
+
+		input_report_key(dev, BTN_TRIGGER_HAPPY9,  ly > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY10, ly < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY11, lx < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY12, lx > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY13, ry > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY14, ry < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY15, rx < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY16, rx > XPAD_STICK_THRESHOLD);
+	} else if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
 		/* left stick */
 		input_report_abs(dev, ABS_X,
 				 (__s16) le16_to_cpup((__le16 *)(data + 12)));
@@ -1012,7 +1085,21 @@ static void xpad360_process_packet(struct usb_xpad *xpad, struct input_dev *dev,
 	input_report_key(dev, BTN_TR,	data[3] & BIT(1));
 	input_report_key(dev, BTN_MODE,	data[3] & BIT(2));
 
-	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+	if (xpad->mapping & MAP_STICKS_TO_BUTTONS) {
+		__s16 lx = (__s16) le16_to_cpup((__le16 *)(data + 6));
+		__s16 ly = ~(__s16) le16_to_cpup((__le16 *)(data + 8));
+		__s16 rx = (__s16) le16_to_cpup((__le16 *)(data + 10));
+		__s16 ry = ~(__s16) le16_to_cpup((__le16 *)(data + 12));
+
+		input_report_key(dev, BTN_TRIGGER_HAPPY9,  ly > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY10, ly < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY11, lx < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY12, lx > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY13, ry > XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY14, ry < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY15, rx < -XPAD_STICK_THRESHOLD);
+		input_report_key(dev, BTN_TRIGGER_HAPPY16, rx > XPAD_STICK_THRESHOLD);
+	} else if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
 		/* left stick */
 		input_report_abs(dev, ABS_X,
 				 (__s16) le16_to_cpup((__le16 *)(data + 6)));
@@ -1211,7 +1298,21 @@ static void xpadone_process_packet(struct usb_xpad *xpad, u16 cmd, unsigned char
 		input_report_key(dev, BTN_THUMBL, data[5] & BIT(6));
 		input_report_key(dev, BTN_THUMBR, data[5] & BIT(7));
 
-		if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+		if (xpad->mapping & MAP_STICKS_TO_BUTTONS) {
+			__s16 lx = (__s16) le16_to_cpup((__le16 *)(data + 10));
+			__s16 ly = ~(__s16) le16_to_cpup((__le16 *)(data + 12));
+			__s16 rx = (__s16) le16_to_cpup((__le16 *)(data + 14));
+			__s16 ry = ~(__s16) le16_to_cpup((__le16 *)(data + 16));
+
+			input_report_key(dev, BTN_TRIGGER_HAPPY9,  ly > XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY10, ly < -XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY11, lx < -XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY12, lx > XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY13, ry > XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY14, ry < -XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY15, rx < -XPAD_STICK_THRESHOLD);
+			input_report_key(dev, BTN_TRIGGER_HAPPY16, rx > XPAD_STICK_THRESHOLD);
+		} else if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
 			/* left stick */
 			input_report_abs(dev, ABS_X,
 					(__s16) le16_to_cpup((__le16 *)(data + 10)));
@@ -2157,6 +2258,9 @@ static void xpad_set_up_abs(struct input_dev *input_dev, signed short abs)
 {
 	struct usb_xpad *xpad = input_get_drvdata(input_dev);
 
+	/* kernel 3.4 input_set_abs_params does not set EV_ABS in evbit */
+	__set_bit(EV_ABS, input_dev->evbit);
+
 	switch (abs) {
 	case ABS_X:
 	case ABS_Y:
@@ -2235,7 +2339,10 @@ static int xpad_init_input(struct usb_xpad *xpad)
 		input_dev->close = xpad_close;
 	}
 
-	if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
+	if (xpad->mapping & MAP_STICKS_TO_BUTTONS) {
+		for (i = 0; xpad_btn_sticks[i] >= 0; i++)
+			input_set_capability(input_dev, EV_KEY, xpad_btn_sticks[i]);
+	} else if (!(xpad->mapping & MAP_STICKS_TO_NULL)) {
 		/* set up axes */
 		for (i = 0; xpad_abs[i] >= 0; i++)
 			xpad_set_up_abs(input_dev, xpad_abs[i]);
@@ -2381,6 +2488,10 @@ static int xpad_probe(struct usb_interface *intf, const struct usb_device_id *id
 			xpad->mapping |= MAP_TRIGGERS_TO_BUTTONS;
 		if (sticks_to_null)
 			xpad->mapping |= MAP_STICKS_TO_NULL;
+	}
+
+	if (axes_to_buttons) {
+		xpad->mapping |= MAP_STICKS_TO_BUTTONS | MAP_TRIGGERS_TO_BUTTONS;
 	}
 
 	if (xpad->xtype == XTYPE_XBOXONE &&
